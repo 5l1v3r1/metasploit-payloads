@@ -38,6 +38,9 @@ extern DWORD remote_request_core_transport_add(Remote* remote, Packet* packet);
 extern DWORD remote_request_core_transport_remove(Remote* remote, Packet* packet);
 
 extern BOOL remote_request_core_migrate(Remote *remote, Packet *packet, DWORD* pResult);
+#ifdef _WIN32
+extern BOOL remote_request_core_switch_arch(Remote *remote, Packet *packet, DWORD* pResult);
+#endif
 
 // Local remote response implementors
 extern DWORD remote_response_core_console_write(Remote *remote, Packet *packet);
@@ -103,6 +106,10 @@ Command baseCommands[] =
 	COMMAND_REQ("core_transport_remove", remote_request_core_transport_remove),
 	// Migration
 	COMMAND_INLINE_REQ("core_migrate", remote_request_core_migrate),
+#ifdef _WIN32
+	// Migration
+	COMMAND_INLINE_REQ("core_switch_arch", remote_request_core_switch_arch),
+#endif
 	// Shutdown
 	COMMAND_INLINE_REQ("core_shutdown", remote_request_core_shutdown),
 	// Terminator

